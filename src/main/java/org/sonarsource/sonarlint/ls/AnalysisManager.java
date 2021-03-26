@@ -68,6 +68,9 @@ import org.sonarsource.sonarlint.ls.SonarLintExtendedLanguageClient.GetJavaConfi
 import org.sonarsource.sonarlint.ls.connected.ProjectBindingManager;
 import org.sonarsource.sonarlint.ls.connected.ProjectBindingWrapper;
 import org.sonarsource.sonarlint.ls.connected.ServerIssueTrackerWrapper;
+import org.sonarsource.sonarlint.ls.file.FileLanguageCache;
+import org.sonarsource.sonarlint.ls.file.FileTypeClassifier;
+import org.sonarsource.sonarlint.ls.file.LanguageServerFileWalker;
 import org.sonarsource.sonarlint.ls.folders.WorkspaceFolderWrapper;
 import org.sonarsource.sonarlint.ls.folders.WorkspaceFoldersManager;
 import org.sonarsource.sonarlint.ls.java.JavaSdkUtil;
@@ -102,7 +105,8 @@ public class AnalysisManager implements WorkspaceSettingsChangeListener {
 
   private final SonarLintExtendedLanguageClient client;
 
-  private final Map<URI, String> languageIdPerFileURI = new ConcurrentHashMap<>();
+  private final FileLanguageCache fileLanguageCache = new FileLanguageCache();
+  private final FileTypeClassifier fileTypeClassifier = new FileTypeClassifier(fileLanguageCache);
   private final Map<URI, String> fileContentPerFileURI = new ConcurrentHashMap<>();
   private final Map<URI, List<Issue>> issuesPerFileURI = new ConcurrentHashMap<>();
   private final Map<URI, List<ServerIssue>> taintVulnerabilitiesPerFile;
@@ -150,7 +154,7 @@ public class AnalysisManager implements WorkspaceSettingsChangeListener {
   }
 
   public void didOpen(URI fileUri, String languageId, String fileContent) {
-    languageIdPerFileURI.put(fileUri, languageId);
+    fileLanguageCache.put(fileUri, languageId);
     fileContentPerFileURI.put(fileUri, fileContent);
     analyzeAsync(fileUri, true);
   }
@@ -201,7 +205,7 @@ public class AnalysisManager implements WorkspaceSettingsChangeListener {
 
   public void didClose(URI fileUri) {
     LOG.debug("File '{}' closed. Cleaning diagnostics.", fileUri);
-    languageIdPerFileURI.remove(fileUri);
+    fileLanguageCache.remove(fileUri);
     fileContentPerFileURI.remove(fileUri);
     javaConfigPerFileURI.remove(fileUri);
     issuesPerFileURI.remove(fileUri);
@@ -226,7 +230,7 @@ public class AnalysisManager implements WorkspaceSettingsChangeListener {
 
   private void analyze(URI fileUri, boolean shouldFetchServerIssues) {
     final Optional<GetJavaConfigResponse> javaConfigOpt = getJavaConfigFromCacheOrFetch(fileUri);
-    if (isJava(fileUri) && !javaConfigOpt.isPresent()) {
+    if (fileLanguageCache.isJava(fileUri) && !javaConfigOpt.isPresent()) {
       LOG.debug("Skipping analysis of Java file '{}' because SonarLint was unable to query project configuration (classpath, source level, ...)", fileUri);
       return;
     }
@@ -254,7 +258,7 @@ public class AnalysisManager implements WorkspaceSettingsChangeListener {
         if (!connectedEngine.getExcludedFiles(binding.get().getBinding(),
           singleton(fileUri),
           uri -> getFileRelativePath(baseDir, uri),
-          uri -> isTest(settings, uri, javaConfigOpt))
+          uri -> fileTypeClassifier.isTest(settings, uri, javaConfigOpt))
           .isEmpty()) {
           LOG.debug("Skip analysis of excluded file: {}", fileUri);
           return;
@@ -358,7 +362,8 @@ public class AnalysisManager implements WorkspaceSettingsChangeListener {
     Optional<GetJavaConfigResponse> javaConfig) {
     StandaloneAnalysisConfiguration configuration = StandaloneAnalysisConfiguration.builder()
       .setBaseDir(baseDir)
-      .addInputFiles(new DefaultClientInputFile(uri, getFileRelativePath(baseDir, uri), content, isTest(settings, uri, javaConfig), languageIdPerFileURI.get(uri)))
+      .setClientFileWalker(new LanguageServerFileWalker(baseDir, settings, javaConfig, fileTypeClassifier))
+      .addInputFiles(new DefaultClientInputFile(uri, getFileRelativePath(baseDir, uri), content, fileTypeClassifier.isTest(settings, uri, javaConfig), fileLanguageCache.getLanguageFor(uri)))
       .putAllExtraProperties(settings.getAnalyzerProperties())
       .putAllExtraProperties(configureJavaProperties(uri))
       .addExcludedRules(settingsManager.getCurrentSettings().getExcludedRules())
@@ -379,7 +384,7 @@ public class AnalysisManager implements WorkspaceSettingsChangeListener {
     ConnectedAnalysisConfiguration configuration = ConnectedAnalysisConfiguration.builder()
       .setProjectKey(settings.getProjectKey())
       .setBaseDir(baseDir)
-      .addInputFile(new DefaultClientInputFile(uri, getFileRelativePath(baseDir, uri), content, isTest(settings, uri, javaConfig), languageIdPerFileURI.get(uri)))
+      .addInputFile(new DefaultClientInputFile(uri, getFileRelativePath(baseDir, uri), content, fileTypeClassifier.isTest(settings, uri, javaConfig), fileLanguageCache.getLanguageFor(uri)))
       .putAllExtraProperties(settings.getAnalyzerProperties())
       .putAllExtraProperties(configureJavaProperties(uri))
       .build();
@@ -595,7 +600,7 @@ public class AnalysisManager implements WorkspaceSettingsChangeListener {
 
   private void analyzeAllOpenJavaFiles() {
     for (URI fileUri : fileContentPerFileURI.keySet()) {
-      if (isJava(fileUri)) {
+      if (fileLanguageCache.isJava(fileUri)) {
         analyzeAsync(fileUri, false);
       }
     }
@@ -633,7 +638,7 @@ public class AnalysisManager implements WorkspaceSettingsChangeListener {
    * Try to fetch Java config. In case of any error, cache an empty result to avoid repeted calls.
    */
   private CompletableFuture<Optional<GetJavaConfigResponse>> getJavaConfigFromCacheOrFetchAsync(URI fileUri) {
-    if (!isJava(fileUri)) {
+    if (!fileLanguageCache.isJava(fileUri)) {
       return CompletableFuture.completedFuture(Optional.empty());
     }
     Optional<GetJavaConfigResponse> javaConfigFromCache = javaConfigPerFileURI.get(fileUri);
@@ -680,25 +685,6 @@ public class AnalysisManager implements WorkspaceSettingsChangeListener {
     if (serverMode == SonarLintExtendedLanguageServer.ServerMode.STANDARD) {
       analyzeAllOpenJavaFiles();
     }
-  }
-
-  private boolean isTest(WorkspaceFolderSettings settings, URI fileUri, Optional<GetJavaConfigResponse> javaConfig) {
-    if (isJava(fileUri)
-      && javaConfig
-        .map(GetJavaConfigResponse::isTest)
-        .orElse(false)) {
-      LOG.debug("Classified as test by vscode-java");
-      return true;
-    }
-    if (settings.getTestMatcher().matches(Paths.get(fileUri))) {
-      LOG.debug("Classified as test by configured 'testFilePattern' setting");
-      return true;
-    }
-    return false;
-  }
-
-  private boolean isJava(URI fileUri) {
-    return "java".equals(languageIdPerFileURI.get(fileUri));
   }
 
 }
