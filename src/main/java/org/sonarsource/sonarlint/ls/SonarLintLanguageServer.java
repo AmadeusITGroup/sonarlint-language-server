@@ -58,6 +58,7 @@ import org.eclipse.lsp4j.ServerInfo;
 import org.eclipse.lsp4j.TextDocumentSyncKind;
 import org.eclipse.lsp4j.TextDocumentSyncOptions;
 import org.eclipse.lsp4j.WorkDoneProgressCancelParams;
+import org.eclipse.lsp4j.WorkspaceFoldersChangeEvent;
 import org.eclipse.lsp4j.WorkspaceFoldersOptions;
 import org.eclipse.lsp4j.WorkspaceServerCapabilities;
 import org.eclipse.lsp4j.jsonrpc.CompletableFutures;
@@ -70,6 +71,7 @@ import org.sonarsource.sonarlint.ls.connected.ProjectBindingManager;
 import org.sonarsource.sonarlint.ls.connected.SecurityHotspotsHandlerServer;
 import org.sonarsource.sonarlint.ls.connected.notifications.ServerNotifications;
 import org.sonarsource.sonarlint.ls.folders.WorkspaceFoldersManager;
+import org.sonarsource.sonarlint.ls.folders.WorkspaceFoldersProvider;
 import org.sonarsource.sonarlint.ls.http.ApacheHttpClient;
 import org.sonarsource.sonarlint.ls.log.LanguageClientLogOutput;
 import org.sonarsource.sonarlint.ls.progress.ProgressManager;
@@ -123,7 +125,7 @@ public class SonarLintLanguageServer implements SonarLintExtendedLanguageServer,
     this.progressManager = new ProgressManager(client);
     this.settingsManager = new SettingsManager(this.client, this.workspaceFoldersManager);
     this.nodeJsRuntime = new NodeJsRuntime(settingsManager);
-    this.enginesFactory = new EnginesFactory(analyzers, lsLogOutput, nodeJsRuntime);
+    this.enginesFactory = new EnginesFactory(analyzers, lsLogOutput, nodeJsRuntime, new WorkspaceFoldersProvider(workspaceFoldersManager));
     this.settingsManager.addListener(telemetry);
     this.settingsManager.addListener(lsLogOutput);
     this.bindingManager = new ProjectBindingManager(enginesFactory, workspaceFoldersManager, settingsManager, client, progressManager, httpClient);
@@ -318,7 +320,9 @@ public class SonarLintLanguageServer implements SonarLintExtendedLanguageServer,
 
   @Override
   public void didChangeWorkspaceFolders(DidChangeWorkspaceFoldersParams params) {
-    workspaceFoldersManager.didChangeWorkspaceFolders(params.getEvent());
+    WorkspaceFoldersChangeEvent event = params.getEvent();
+    analysisManager.didChangeWorkspaceFolders(event);
+    workspaceFoldersManager.didChangeWorkspaceFolders(event);
   }
 
   @Override

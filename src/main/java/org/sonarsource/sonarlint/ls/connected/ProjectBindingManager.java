@@ -86,7 +86,7 @@ public class ProjectBindingManager implements WorkspaceSettingsChangeListener, W
 
   private final WorkspaceFoldersManager foldersManager;
   private final SettingsManager settingsManager;
-  private Map<URI, Optional<ProjectBindingWrapper>> folderBindingCache;
+  private final Map<URI, Optional<ProjectBindingWrapper>> folderBindingCache;
   private final ConcurrentMap<URI, Optional<ProjectBindingWrapper>> fileBindingCache = new ConcurrentHashMap<>();
   private final ConcurrentMap<String, Optional<ConnectedSonarLintEngine>> connectedEngineCacheByConnectionId = new ConcurrentHashMap<>();
   private final ProgressManager progressManager;
@@ -115,6 +115,23 @@ public class ProjectBindingManager implements WorkspaceSettingsChangeListener, W
   // Can't use constructor injection because of cyclic dependency
   public void setAnalysisManager(AnalysisManager analysisManager) {
     this.analysisManager = analysisManager;
+  }
+
+  /**
+   * Return the binding of the given folder.
+   *
+   * @return empty if the folder is unbound
+   */
+  public Optional<ProjectBindingWrapper> getBinding(WorkspaceFolderWrapper folder) {
+    return folderBindingCache.computeIfAbsent(folder.getUri(), k -> {
+      WorkspaceFolderSettings settings = folder.getSettings();
+      if (!settings.hasBinding()) {
+        return Optional.empty();
+      } else {
+        Path folderRoot = folder.getRootPath();
+        return Optional.ofNullable(computeProjectBinding(settings, folderRoot));
+      }
+    });
   }
 
   /**

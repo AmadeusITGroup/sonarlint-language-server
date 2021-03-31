@@ -49,10 +49,14 @@ import org.eclipse.lsp4j.DiagnosticSeverity;
 import org.eclipse.lsp4j.Position;
 import org.eclipse.lsp4j.PublishDiagnosticsParams;
 import org.eclipse.lsp4j.Range;
+import org.eclipse.lsp4j.WorkspaceFolder;
+import org.eclipse.lsp4j.WorkspaceFoldersChangeEvent;
 import org.sonar.api.utils.log.Logger;
 import org.sonar.api.utils.log.Loggers;
 import org.sonarsource.sonarlint.core.client.api.common.Language;
+import org.sonarsource.sonarlint.core.client.api.common.ModuleInfo;
 import org.sonarsource.sonarlint.core.client.api.common.PluginDetails;
+import org.sonarsource.sonarlint.core.client.api.common.SonarLintEngine;
 import org.sonarsource.sonarlint.core.client.api.common.analysis.AnalysisResults;
 import org.sonarsource.sonarlint.core.client.api.common.analysis.ClientInputFile;
 import org.sonarsource.sonarlint.core.client.api.common.analysis.Issue;
@@ -73,6 +77,7 @@ import org.sonarsource.sonarlint.ls.file.FileTypeClassifier;
 import org.sonarsource.sonarlint.ls.file.LanguageServerFileWalker;
 import org.sonarsource.sonarlint.ls.folders.WorkspaceFolderWrapper;
 import org.sonarsource.sonarlint.ls.folders.WorkspaceFoldersManager;
+import org.sonarsource.sonarlint.ls.folders.WorkspaceFoldersProvider;
 import org.sonarsource.sonarlint.ls.java.JavaSdkUtil;
 import org.sonarsource.sonarlint.ls.log.LanguageClientLogOutput;
 import org.sonarsource.sonarlint.ls.settings.SettingsManager;
@@ -127,13 +132,13 @@ public class AnalysisManager implements WorkspaceSettingsChangeListener {
   private final ExecutorService analysisExecutor;
 
   public AnalysisManager(LanguageClientLogOutput lsLogOutput, EnginesFactory enginesFactory, SonarLintExtendedLanguageClient client, SonarLintTelemetry telemetry,
-    WorkspaceFoldersManager workspaceFoldersManager, SettingsManager settingsManager, ProjectBindingManager bindingManager) {
+                         WorkspaceFoldersManager workspaceFoldersManager, SettingsManager settingsManager, ProjectBindingManager bindingManager) {
     this(lsLogOutput, enginesFactory, client, telemetry, workspaceFoldersManager, settingsManager, bindingManager, new ConcurrentHashMap<>());
   }
 
   public AnalysisManager(LanguageClientLogOutput lsLogOutput, EnginesFactory enginesFactory, SonarLintExtendedLanguageClient client, SonarLintTelemetry telemetry,
-    WorkspaceFoldersManager workspaceFoldersManager, SettingsManager settingsManager, ProjectBindingManager bindingManager,
-    Map<URI, List<ServerIssue>> taintVulnerabilitiesPerFile) {
+                         WorkspaceFoldersManager workspaceFoldersManager, SettingsManager settingsManager, ProjectBindingManager bindingManager,
+                         Map<URI, List<ServerIssue>> taintVulnerabilitiesPerFile) {
     this.lsLogOutput = lsLogOutput;
     this.enginesFactory = enginesFactory;
     this.client = client;
@@ -162,6 +167,26 @@ public class AnalysisManager implements WorkspaceSettingsChangeListener {
   public void didChange(URI fileUri, String fileContent) {
     fileContentPerFileURI.put(fileUri, fileContent);
     eventMap.put(fileUri, System.currentTimeMillis());
+  }
+
+  public void didChangeWorkspaceFolders(WorkspaceFoldersChangeEvent event) {
+    LOG.info("Workspace event: " + event);
+    for (WorkspaceFolder folder : event.getRemoved()) {
+      URI folderUri = URI.create(folder.getUri());
+      findEngineFor(folderUri).moduleDeleted(new ModuleInfo(WorkspaceFoldersProvider.key(folder), folderUri, null));
+    }
+    for (WorkspaceFolder folder : event.getAdded()) {
+      URI folderUri = URI.create(folder.getUri());
+      findEngineFor(folderUri).moduleAdded(new ModuleInfo(WorkspaceFoldersProvider.key(folder), folderUri, null));
+    }
+  }
+
+  private SonarLintEngine findEngineFor(URI folderUri) {
+    Optional<WorkspaceFolderWrapper> folder = workspaceFoldersManager.findFolder(folderUri);
+    return folder.flatMap(bindingManager::getBinding)
+      .map(ProjectBindingWrapper::getEngine)
+      .map(SonarLintEngine.class::cast)
+      .orElseGet(this::getOrCreateStandaloneEngine);
   }
 
   private class EventWatcher extends Thread {
@@ -359,9 +384,10 @@ public class AnalysisManager implements WorkspaceSettingsChangeListener {
   }
 
   private AnalysisResultsWrapper analyzeStandalone(WorkspaceFolderSettings settings, Path baseDir, URI uri, String content, IssueListener issueListener,
-    Optional<GetJavaConfigResponse> javaConfig) {
+                                                   Optional<GetJavaConfigResponse> javaConfig) {
     StandaloneAnalysisConfiguration configuration = StandaloneAnalysisConfiguration.builder()
       .setBaseDir(baseDir)
+      .setModuleKey(baseDir.getFileName().toString())
       .setClientFileWalker(new LanguageServerFileWalker(baseDir, settings, javaConfig, fileTypeClassifier))
       .addInputFiles(new DefaultClientInputFile(uri, getFileRelativePath(baseDir, uri), content, fileTypeClassifier.isTest(settings, uri, javaConfig), fileLanguageCache.getLanguageFor(uri)))
       .putAllExtraProperties(settings.getAnalyzerProperties())
@@ -380,10 +406,11 @@ public class AnalysisManager implements WorkspaceSettingsChangeListener {
   }
 
   public AnalysisResultsWrapper analyzeConnected(ProjectBindingWrapper binding, WorkspaceFolderSettings settings, Path baseDir, URI uri, String content,
-    IssueListener issueListener, boolean shouldFetchServerIssues, Optional<GetJavaConfigResponse> javaConfig) {
+                                                 IssueListener issueListener, boolean shouldFetchServerIssues, Optional<GetJavaConfigResponse> javaConfig) {
     ConnectedAnalysisConfiguration configuration = ConnectedAnalysisConfiguration.builder()
       .setProjectKey(settings.getProjectKey())
       .setBaseDir(baseDir)
+      .setModuleKey(baseDir)
       .addInputFile(new DefaultClientInputFile(uri, getFileRelativePath(baseDir, uri), content, fileTypeClassifier.isTest(settings, uri, javaConfig), fileLanguageCache.getLanguageFor(uri)))
       .putAllExtraProperties(settings.getAnalyzerProperties())
       .putAllExtraProperties(configureJavaProperties(uri))
@@ -416,7 +443,7 @@ public class AnalysisManager implements WorkspaceSettingsChangeListener {
   }
 
   /**
-   * @param analyze Analysis callback
+   * @param analyze          Analysis callback
    * @param postAnalysisTask Code that will be logged outside the analysis flag, but still counted in the total analysis duration.
    */
   private AnalysisResultsWrapper analyzeWithTiming(Supplier<AnalysisResults> analyze, Collection<PluginDetails> allPlugins, Runnable postAnalysisTask) {
@@ -661,7 +688,7 @@ public class AnalysisManager implements WorkspaceSettingsChangeListener {
   }
 
   public void didClasspathUpdate(URI projectUri) {
-    for (Iterator<Entry<URI, Optional<GetJavaConfigResponse>>> it = javaConfigPerFileURI.entrySet().iterator(); it.hasNext();) {
+    for (Iterator<Entry<URI, Optional<GetJavaConfigResponse>>> it = javaConfigPerFileURI.entrySet().iterator(); it.hasNext(); ) {
       Entry<URI, Optional<GetJavaConfigResponse>> entry = it.next();
       Optional<GetJavaConfigResponse> cachedResponseOpt = entry.getValue();
       // If we have cached an empty result, still clear the value on classpath update to force next analysis to re-attempt fetch
