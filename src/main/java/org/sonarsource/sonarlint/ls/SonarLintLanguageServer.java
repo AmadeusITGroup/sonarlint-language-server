@@ -101,7 +101,6 @@ public class SonarLintLanguageServer implements SonarLintExtendedLanguageServer,
   private final ExecutorService threadPool;
   private final SecurityHotspotsHandlerServer securityHotspotsHandlerServer;
   private final ApacheHttpClient httpClient;
-  private final AtomicLong fileEventChangeCount;
 
   /**
    * Keep track of value 'sonarlint.trace.server' on client side. Not used currently, but keeping it just in case.
@@ -142,7 +141,6 @@ public class SonarLintLanguageServer implements SonarLintExtendedLanguageServer,
     this.settingsManager.addListener(analysisManager);
     this.commandManager = new CommandManager(client, settingsManager, bindingManager, analysisManager, telemetry);
     this.securityHotspotsHandlerServer = new SecurityHotspotsHandlerServer(lsLogOutput, bindingManager, client, telemetry);
-    fileEventChangeCount = new AtomicLong();
     launcher.startListening();
   }
 
@@ -318,11 +316,7 @@ public class SonarLintLanguageServer implements SonarLintExtendedLanguageServer,
 
   @Override
   public void didChangeWatchedFiles(DidChangeWatchedFilesParams params) {
-    long current = fileEventChangeCount.incrementAndGet();
-    params.getChanges().forEach(f -> {
-      this.client.logMessage(new MessageParams(MessageType.Info,
-        String.format("Event %d: File '%s' was %s", current, f.getUri(), f.getType())));
-    });
+    analysisManager.didChangeWatchedFiles(params.getChanges());
   }
 
   @Override

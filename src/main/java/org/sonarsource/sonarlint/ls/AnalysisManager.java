@@ -46,13 +46,18 @@ import javax.annotation.CheckForNull;
 import javax.annotation.Nullable;
 import org.eclipse.lsp4j.Diagnostic;
 import org.eclipse.lsp4j.DiagnosticSeverity;
+import org.eclipse.lsp4j.FileChangeType;
+import org.eclipse.lsp4j.FileEvent;
 import org.eclipse.lsp4j.Position;
 import org.eclipse.lsp4j.PublishDiagnosticsParams;
 import org.eclipse.lsp4j.Range;
+import org.sonar.api.scanner.fs.ProjectFileEvent;
 import org.sonar.api.utils.log.Logger;
 import org.sonar.api.utils.log.Loggers;
+import org.sonarsource.sonarlint.core.client.api.common.ClientProjectFileEvent;
 import org.sonarsource.sonarlint.core.client.api.common.Language;
 import org.sonarsource.sonarlint.core.client.api.common.PluginDetails;
+import org.sonarsource.sonarlint.core.client.api.common.SonarLintEngine;
 import org.sonarsource.sonarlint.core.client.api.common.analysis.AnalysisResults;
 import org.sonarsource.sonarlint.core.client.api.common.analysis.ClientInputFile;
 import org.sonarsource.sonarlint.core.client.api.common.analysis.Issue;
@@ -162,6 +167,48 @@ public class AnalysisManager implements WorkspaceSettingsChangeListener {
   public void didChange(URI fileUri, String fileContent) {
     fileContentPerFileURI.put(fileUri, fileContent);
     eventMap.put(fileUri, System.currentTimeMillis());
+  }
+
+  public void didChangeWatchedFiles(List<FileEvent> changes) {
+    changes.forEach(f -> {
+      URI fileUri = URI.create(f.getUri());
+      Optional<WorkspaceFolderWrapper> workspaceFolder = workspaceFoldersManager.findFolderForFile(fileUri);
+
+      WorkspaceFolderSettings settings = workspaceFolder.map(WorkspaceFolderWrapper::getSettings)
+        .orElse(settingsManager.getCurrentDefaultFolderSettings());
+
+      Path baseDir = workspaceFolder.map(WorkspaceFolderWrapper::getRootPath)
+        // Default to take file parent dir if file is not part of any workspace
+        .orElse(Paths.get(fileUri).getParent());
+
+      Optional<ProjectBindingWrapper> binding = bindingManager.getBinding(fileUri);
+
+      SonarLintEngine engineForFile = binding.isPresent() ? binding.get().getEngine() : getOrCreateStandaloneEngine();
+
+      // TODO Properly load file content
+      String content = LocalCodeFile.from(fileUri).content();
+      // TODO Find real Java config
+      Optional<GetJavaConfigResponse> javaConfig = empty();
+      // TODO Detect language ID
+      String languageId = "python";
+
+      ClientInputFile inputFile = new DefaultClientInputFile(fileUri, getFileRelativePath(baseDir, fileUri), content,
+        fileTypeClassifier.isTest(settings, fileUri, javaConfig), languageId);
+
+      engineForFile.fireProjectFileEvent(ClientProjectFileEvent.of(inputFile, translate(f.getType())));
+    });
+  }
+
+  private static ProjectFileEvent.Type translate(FileChangeType type) {
+    switch(type) {
+      case Created:
+        return ProjectFileEvent.Type.Created;
+      case Changed:
+        return ProjectFileEvent.Type.Modified;
+      case Deleted:
+        return ProjectFileEvent.Type.Deleted;
+    }
+    throw new IllegalArgumentException("Unknown event type: " + type);
   }
 
   private class EventWatcher extends Thread {
