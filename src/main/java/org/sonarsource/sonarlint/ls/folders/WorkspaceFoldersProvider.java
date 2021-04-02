@@ -19,29 +19,39 @@
  */
 package org.sonarsource.sonarlint.ls.folders;
 
-import java.nio.file.Path;
 import java.util.List;
 import java.util.stream.Collectors;
-import org.eclipse.lsp4j.WorkspaceFolder;
 import org.sonarsource.sonarlint.core.client.api.common.ModuleInfo;
 import org.sonarsource.sonarlint.core.client.api.common.ModulesProvider;
+import org.sonarsource.sonarlint.ls.file.FileTypeClassifier;
+import org.sonarsource.sonarlint.ls.file.FolderFileWalker;
+import org.sonarsource.sonarlint.ls.java.JavaConfigProvider;
 
 public class WorkspaceFoldersProvider implements ModulesProvider<String> {
 
-  public static String key(WorkspaceFolder folder) {
-    return folder.getName();
+  public static String key(WorkspaceFolderWrapper folder) {
+    return folder.getLspFolder().getName();
   }
 
   private final WorkspaceFoldersManager workspaceFoldersManager;
+  private final FileTypeClassifier fileTypeClassifier;
+  private final JavaConfigProvider javaConfigProvider;
 
-  public WorkspaceFoldersProvider(WorkspaceFoldersManager workspaceFoldersManager) {
+  public WorkspaceFoldersProvider(WorkspaceFoldersManager workspaceFoldersManager, FileTypeClassifier fileTypeClassifier, JavaConfigProvider javaConfigProvider) {
     this.workspaceFoldersManager = workspaceFoldersManager;
+    this.fileTypeClassifier = fileTypeClassifier;
+    this.javaConfigProvider = javaConfigProvider;
   }
 
   @Override
   public List<ModuleInfo<String>> getModules() {
     return workspaceFoldersManager.getAll().stream()
-      .map(folder -> new ModuleInfo<>(key(folder.getLspFolder()), folder.getUri(), null))
+      .map(this::createModuleInfo)
       .collect(Collectors.toList());
+  }
+
+  private ModuleInfo<String> createModuleInfo(WorkspaceFolderWrapper folder) {
+    FolderFileWalker clientFileWalker = new FolderFileWalker(folder, javaConfigProvider, fileTypeClassifier);
+    return new ModuleInfo<>(key(folder), clientFileWalker);
   }
 }

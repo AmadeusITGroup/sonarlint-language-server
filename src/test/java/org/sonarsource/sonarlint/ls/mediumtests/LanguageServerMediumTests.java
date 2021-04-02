@@ -451,7 +451,7 @@ class LanguageServerMediumTests extends AbstractLanguageServerMediumTests {
   @Test
   void fetchWorkspaceFolderConfigurationWhenAdded() throws Exception {
     client.settingsLatch = new CountDownLatch(1);
-    String folderUri = "some://added_uri";
+    String folderUri = "file:///added_uri";
     client.folderSettings.put(folderUri, buildSonarLintSettingsSection("another pattern", null, null, true));
 
     try {
@@ -461,7 +461,7 @@ class LanguageServerMediumTests extends AbstractLanguageServerMediumTests {
       awaitLatch(client.settingsLatch);
 
       assertLogContains(
-        "Workspace folder 'WorkspaceFolder[uri=some://added_uri,name=Added]' configuration updated: WorkspaceFolderSettings[analyzerProperties={},testFilePattern=another pattern,connectionId=<null>,projectKey=<null>]");
+        "Workspace folder 'WorkspaceFolder[uri=file:///added_uri,name=Added]' configuration updated: WorkspaceFolderSettings[analyzerProperties={},testFilePattern=another pattern,connectionId=<null>,projectKey=<null>]");
     } finally {
       lsProxy.getWorkspaceService()
         .didChangeWorkspaceFolders(

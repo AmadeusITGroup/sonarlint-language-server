@@ -43,7 +43,7 @@ public class FileTypeClassifier {
       LOG.debug("Classified as test by vscode-java");
       return true;
     }
-    if (settings.getTestMatcher().matches(Paths.get(fileUri))) {
+    if (settings != null && settings.getTestMatcher().matches(Paths.get(fileUri))) {
       LOG.debug("Classified as test by configured 'testFilePattern' setting");
       return true;
     }

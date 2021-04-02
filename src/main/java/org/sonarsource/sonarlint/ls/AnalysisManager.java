@@ -34,11 +34,9 @@ import java.util.Map;
 import java.util.Map.Entry;
 import java.util.Objects;
 import java.util.Optional;
-import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
-import java.util.concurrent.TimeUnit;
 import java.util.function.Supplier;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
@@ -53,6 +51,7 @@ import org.eclipse.lsp4j.WorkspaceFolder;
 import org.eclipse.lsp4j.WorkspaceFoldersChangeEvent;
 import org.sonar.api.utils.log.Logger;
 import org.sonar.api.utils.log.Loggers;
+import org.sonarsource.sonarlint.core.client.api.common.ClientFileWalker;
 import org.sonarsource.sonarlint.core.client.api.common.Language;
 import org.sonarsource.sonarlint.core.client.api.common.ModuleInfo;
 import org.sonarsource.sonarlint.core.client.api.common.PluginDetails;
@@ -74,10 +73,13 @@ import org.sonarsource.sonarlint.ls.connected.ProjectBindingWrapper;
 import org.sonarsource.sonarlint.ls.connected.ServerIssueTrackerWrapper;
 import org.sonarsource.sonarlint.ls.file.FileLanguageCache;
 import org.sonarsource.sonarlint.ls.file.FileTypeClassifier;
-import org.sonarsource.sonarlint.ls.file.LanguageServerFileWalker;
+import org.sonarsource.sonarlint.ls.file.FolderFileWalker;
+import org.sonarsource.sonarlint.ls.file.SingleFileWalker;
+import org.sonarsource.sonarlint.ls.folders.WorkspaceFolderLifecycleListener;
 import org.sonarsource.sonarlint.ls.folders.WorkspaceFolderWrapper;
 import org.sonarsource.sonarlint.ls.folders.WorkspaceFoldersManager;
 import org.sonarsource.sonarlint.ls.folders.WorkspaceFoldersProvider;
+import org.sonarsource.sonarlint.ls.java.JavaConfigProvider;
 import org.sonarsource.sonarlint.ls.java.JavaSdkUtil;
 import org.sonarsource.sonarlint.ls.log.LanguageClientLogOutput;
 import org.sonarsource.sonarlint.ls.settings.SettingsManager;
@@ -92,7 +94,7 @@ import static java.util.Optional.ofNullable;
 import static java.util.stream.Collectors.joining;
 import static org.sonarsource.sonarlint.ls.Utils.pluralize;
 
-public class AnalysisManager implements WorkspaceSettingsChangeListener {
+public class AnalysisManager implements WorkspaceSettingsChangeListener, WorkspaceFolderLifecycleListener {
 
   private static final int DELAY_MS = 500;
   private static final int QUEUE_POLLING_PERIOD_MS = 200;
@@ -110,12 +112,13 @@ public class AnalysisManager implements WorkspaceSettingsChangeListener {
 
   private final SonarLintExtendedLanguageClient client;
 
-  private final FileLanguageCache fileLanguageCache = new FileLanguageCache();
-  private final FileTypeClassifier fileTypeClassifier = new FileTypeClassifier(fileLanguageCache);
+  private final FileTypeClassifier fileTypeClassifier;
+  private final FileLanguageCache fileLanguageCache;
+  private final JavaConfigProvider javaConfigProvider;
   private final Map<URI, String> fileContentPerFileURI = new ConcurrentHashMap<>();
   private final Map<URI, List<Issue>> issuesPerFileURI = new ConcurrentHashMap<>();
   private final Map<URI, List<ServerIssue>> taintVulnerabilitiesPerFile;
-  private final Map<URI, Optional<GetJavaConfigResponse>> javaConfigPerFileURI = new ConcurrentHashMap<>();
+  public final Map<URI, Optional<GetJavaConfigResponse>> javaConfigPerFileURI = new ConcurrentHashMap<>();
   private final Map<Path, List<Path>> jvmClasspathPerJavaHome = new ConcurrentHashMap<>();
   // entries in this map mean that the file is "dirty"
   private final Map<URI, Long> eventMap = new ConcurrentHashMap<>();
@@ -132,12 +135,12 @@ public class AnalysisManager implements WorkspaceSettingsChangeListener {
   private final ExecutorService analysisExecutor;
 
   public AnalysisManager(LanguageClientLogOutput lsLogOutput, EnginesFactory enginesFactory, SonarLintExtendedLanguageClient client, SonarLintTelemetry telemetry,
-                         WorkspaceFoldersManager workspaceFoldersManager, SettingsManager settingsManager, ProjectBindingManager bindingManager) {
-    this(lsLogOutput, enginesFactory, client, telemetry, workspaceFoldersManager, settingsManager, bindingManager, new ConcurrentHashMap<>());
+                         WorkspaceFoldersManager workspaceFoldersManager, SettingsManager settingsManager, ProjectBindingManager bindingManager, FileTypeClassifier fileTypeClassifier, FileLanguageCache fileLanguageCache, JavaConfigProvider javaConfigProvider) {
+    this(lsLogOutput, enginesFactory, client, telemetry, workspaceFoldersManager, settingsManager, bindingManager, fileTypeClassifier, fileLanguageCache, javaConfigProvider, new ConcurrentHashMap<>());
   }
 
   public AnalysisManager(LanguageClientLogOutput lsLogOutput, EnginesFactory enginesFactory, SonarLintExtendedLanguageClient client, SonarLintTelemetry telemetry,
-                         WorkspaceFoldersManager workspaceFoldersManager, SettingsManager settingsManager, ProjectBindingManager bindingManager,
+                         WorkspaceFoldersManager workspaceFoldersManager, SettingsManager settingsManager, ProjectBindingManager bindingManager, FileTypeClassifier fileTypeClassifier, FileLanguageCache fileLanguageCache, JavaConfigProvider javaConfigProvider,
                          Map<URI, List<ServerIssue>> taintVulnerabilitiesPerFile) {
     this.lsLogOutput = lsLogOutput;
     this.enginesFactory = enginesFactory;
@@ -146,6 +149,9 @@ public class AnalysisManager implements WorkspaceSettingsChangeListener {
     this.workspaceFoldersManager = workspaceFoldersManager;
     this.settingsManager = settingsManager;
     this.bindingManager = bindingManager;
+    this.fileTypeClassifier = fileTypeClassifier;
+    this.fileLanguageCache = fileLanguageCache;
+    this.javaConfigProvider = javaConfigProvider;
     this.analysisExecutor = Executors.newSingleThreadExecutor(Utils.threadFactory("SonarLint analysis", false));
     this.watcher = new EventWatcher();
     this.taintVulnerabilitiesPerFile = taintVulnerabilitiesPerFile;
@@ -169,24 +175,24 @@ public class AnalysisManager implements WorkspaceSettingsChangeListener {
     eventMap.put(fileUri, System.currentTimeMillis());
   }
 
-  public void didChangeWorkspaceFolders(WorkspaceFoldersChangeEvent event) {
-    LOG.info("Workspace event: " + event);
-    for (WorkspaceFolder folder : event.getRemoved()) {
-      URI folderUri = URI.create(folder.getUri());
-      findEngineFor(folderUri).moduleDeleted(new ModuleInfo(WorkspaceFoldersProvider.key(folder), folderUri, null));
-    }
-    for (WorkspaceFolder folder : event.getAdded()) {
-      URI folderUri = URI.create(folder.getUri());
-      findEngineFor(folderUri).moduleAdded(new ModuleInfo(WorkspaceFoldersProvider.key(folder), folderUri, null));
-    }
-  }
-
-  private SonarLintEngine findEngineFor(URI folderUri) {
-    Optional<WorkspaceFolderWrapper> folder = workspaceFoldersManager.findFolder(folderUri);
-    return folder.flatMap(bindingManager::getBinding)
+  private SonarLintEngine findEngineFor(WorkspaceFolderWrapper folder) {
+    return bindingManager.getBinding(folder)
       .map(ProjectBindingWrapper::getEngine)
       .map(SonarLintEngine.class::cast)
       .orElseGet(this::getOrCreateStandaloneEngine);
+  }
+
+  @Override
+  public void added(WorkspaceFolderWrapper addedFolder) {
+    analysisExecutor.execute(() -> {
+      FolderFileWalker clientFileWalker = new FolderFileWalker(addedFolder, javaConfigProvider, fileTypeClassifier);
+      findEngineFor(addedFolder).moduleAdded(new ModuleInfo(WorkspaceFoldersProvider.key(addedFolder), clientFileWalker));
+    });
+  }
+
+  @Override
+  public void removed(WorkspaceFolderWrapper removedFolder) {
+    analysisExecutor.execute(() -> findEngineFor(removedFolder).moduleDeleted(WorkspaceFoldersProvider.key(removedFolder)));
   }
 
   private class EventWatcher extends Thread {
@@ -254,7 +260,7 @@ public class AnalysisManager implements WorkspaceSettingsChangeListener {
   }
 
   private void analyze(URI fileUri, boolean shouldFetchServerIssues) {
-    final Optional<GetJavaConfigResponse> javaConfigOpt = getJavaConfigFromCacheOrFetch(fileUri);
+    final Optional<GetJavaConfigResponse> javaConfigOpt = javaConfigProvider.getConfig(fileUri);
     if (fileLanguageCache.isJava(fileUri) && !javaConfigOpt.isPresent()) {
       LOG.debug("Skipping analysis of Java file '{}' because SonarLint was unable to query project configuration (classpath, source level, ...)", fileUri);
       return;
@@ -292,7 +298,10 @@ public class AnalysisManager implements WorkspaceSettingsChangeListener {
         analysisResults = analyzeConnected(binding.get(), settings, baseDir, fileUri, content, issueListener, shouldFetchServerIssues, javaConfigOpt);
       } else {
         LOG.info("Analyzing file '{}'...", fileUri);
-        analysisResults = analyzeStandalone(settings, baseDir, fileUri, content, issueListener, javaConfigOpt);
+
+        ClientFileWalker clientFileWalker = workspaceFolder.<ClientFileWalker>map(f -> new FolderFileWalker(workspaceFolder.get(), uri -> javaConfigOpt, fileTypeClassifier))
+          .orElseGet(() -> new SingleFileWalker(fileUri, javaConfigOpt, fileTypeClassifier));
+        analysisResults = analyzeStandalone(settings, baseDir, fileUri, content, issueListener, uri -> javaConfigOpt, clientFileWalker);
       }
       SkippedPluginsNotifier.notifyOnceForSkippedPlugins(analysisResults.results, analysisResults.allPlugins, client);
 
@@ -316,20 +325,6 @@ public class AnalysisManager implements WorkspaceSettingsChangeListener {
       LOG.info("Found {} {}", foundIssues, pluralize(foundIssues, "issue"));
       client.publishDiagnostics(newPublishDiagnostics(fileUri));
     }
-  }
-
-  private Optional<GetJavaConfigResponse> getJavaConfigFromCacheOrFetch(URI fileUri) {
-    Optional<GetJavaConfigResponse> javaConfigOpt;
-    try {
-      javaConfigOpt = getJavaConfigFromCacheOrFetchAsync(fileUri).get(1, TimeUnit.MINUTES);
-    } catch (InterruptedException e) {
-      Utils.interrupted(e);
-      javaConfigOpt = empty();
-    } catch (Exception e) {
-      LOG.warn("Unable to get Java config", e);
-      javaConfigOpt = empty();
-    }
-    return javaConfigOpt;
   }
 
   private IssueListener createIssueListener() {
@@ -384,12 +379,12 @@ public class AnalysisManager implements WorkspaceSettingsChangeListener {
   }
 
   private AnalysisResultsWrapper analyzeStandalone(WorkspaceFolderSettings settings, Path baseDir, URI uri, String content, IssueListener issueListener,
-                                                   Optional<GetJavaConfigResponse> javaConfig) {
+                                                   JavaConfigProvider javaConfigProvider, ClientFileWalker clientFileWalker) {
     StandaloneAnalysisConfiguration configuration = StandaloneAnalysisConfiguration.builder()
       .setBaseDir(baseDir)
       .setModuleKey(baseDir.getFileName().toString())
-      .setClientFileWalker(new LanguageServerFileWalker(baseDir, settings, javaConfig, fileTypeClassifier))
-      .addInputFiles(new DefaultClientInputFile(uri, getFileRelativePath(baseDir, uri), content, fileTypeClassifier.isTest(settings, uri, javaConfig), fileLanguageCache.getLanguageFor(uri)))
+      .setClientFileWalker(clientFileWalker)
+      .addInputFiles(new DefaultClientInputFile(uri, getFileRelativePath(baseDir, uri), content, fileTypeClassifier.isTest(settings, uri, javaConfigProvider.getConfig(uri)), fileLanguageCache.getLanguageFor(uri)))
       .putAllExtraProperties(settings.getAnalyzerProperties())
       .putAllExtraProperties(configureJavaProperties(uri))
       .addExcludedRules(settingsManager.getCurrentSettings().getExcludedRules())
@@ -410,7 +405,7 @@ public class AnalysisManager implements WorkspaceSettingsChangeListener {
     ConnectedAnalysisConfiguration configuration = ConnectedAnalysisConfiguration.builder()
       .setProjectKey(settings.getProjectKey())
       .setBaseDir(baseDir)
-      .setModuleKey(baseDir)
+      .setModuleKey(baseDir.getFileName().toString())
       .addInputFile(new DefaultClientInputFile(uri, getFileRelativePath(baseDir, uri), content, fileTypeClassifier.isTest(settings, uri, javaConfig), fileLanguageCache.getLanguageFor(uri)))
       .putAllExtraProperties(settings.getAnalyzerProperties())
       .putAllExtraProperties(configureJavaProperties(uri))
@@ -659,32 +654,6 @@ public class AnalysisManager implements WorkspaceSettingsChangeListener {
 
   private List<Path> getVmClasspathFromCacheOrCompute(Path vmLocation) {
     return jvmClasspathPerJavaHome.computeIfAbsent(vmLocation, JavaSdkUtil::getJdkClassesRoots);
-  }
-
-  /**
-   * Try to fetch Java config. In case of any error, cache an empty result to avoid repeted calls.
-   */
-  private CompletableFuture<Optional<GetJavaConfigResponse>> getJavaConfigFromCacheOrFetchAsync(URI fileUri) {
-    if (!fileLanguageCache.isJava(fileUri)) {
-      return CompletableFuture.completedFuture(Optional.empty());
-    }
-    Optional<GetJavaConfigResponse> javaConfigFromCache = javaConfigPerFileURI.get(fileUri);
-    if (javaConfigFromCache != null) {
-      return CompletableFuture.completedFuture(javaConfigFromCache);
-    }
-    return client.getJavaConfig(fileUri.toString())
-      .handle((r, t) -> {
-        if (t != null) {
-          LOG.error("Unable to fetch Java configuration of file " + fileUri, t);
-        }
-        return r;
-      })
-      .thenApply(javaConfig -> {
-        Optional<GetJavaConfigResponse> configOpt = ofNullable(javaConfig);
-        javaConfigPerFileURI.put(fileUri, configOpt);
-        LOG.debug("Cached Java config for file '{}'", fileUri);
-        return configOpt;
-      });
   }
 
   public void didClasspathUpdate(URI projectUri) {
