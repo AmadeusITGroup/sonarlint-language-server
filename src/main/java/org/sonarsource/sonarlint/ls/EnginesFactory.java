@@ -61,7 +61,10 @@ public class EnginesFactory {
 
   private static final Language[] CONNECTED_ADDITIONAL_LANGUAGES = {
     Language.APEX,
-    Language.PLSQL
+    Language.PLSQL,
+    Language.C,
+    Language.CPP,
+    Language.OBJC
   };
 
   private final NodeJsRuntime nodeJsRuntime;
