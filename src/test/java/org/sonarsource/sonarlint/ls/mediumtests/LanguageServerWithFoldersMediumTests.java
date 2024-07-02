@@ -19,6 +19,7 @@
  */
 package org.sonarsource.sonarlint.ls.mediumtests;
 
+import java.net.ServerSocket;
 import java.nio.file.Path;
 import java.util.List;
 import java.util.Map;
@@ -33,8 +34,13 @@ import org.eclipse.lsp4j.TextDocumentContentChangeEvent;
 import org.eclipse.lsp4j.VersionedTextDocumentIdentifier;
 import org.eclipse.lsp4j.WorkspaceFolder;
 import org.eclipse.lsp4j.WorkspaceFoldersChangeEvent;
+import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.RegisterExtension;
+import org.sonarsource.sonarlint.core.serverapi.proto.sonarcloud.ws.Organizations;
+import org.sonarsource.sonarlint.core.serverapi.proto.sonarqube.ws.Common;
+import testutils.MockWebServerExtension;
 
 import static java.util.concurrent.TimeUnit.SECONDS;
 import static org.assertj.core.api.Assertions.assertThat;
@@ -50,8 +56,25 @@ class LanguageServerWithFoldersMediumTests extends AbstractLanguageServerMediumT
 
   private static Path folder2BaseDir;
 
+  private static final int SONAR_CLOUD_PORT = findAvailablePort();
+  @RegisterExtension
+  private static final MockWebServerExtension sonarCloudWebServer = new MockWebServerExtension(SONAR_CLOUD_PORT);
+
+  private static int findAvailablePort() {
+    try {
+      ServerSocket socket = new ServerSocket(0);
+      int port = socket.getLocalPort();
+      socket.close();
+      return port;
+    } catch(Throwable t) {
+      throw new IllegalStateException(t);
+    }
+  }
+
   @BeforeAll
   public static void initialize() throws Exception {
+    System.setProperty("sonarlint.internal.sonarcloud.url", "http://localhost:" + SONAR_CLOUD_PORT);
+    System.setProperty("sonarlint.internal.sonarcloud.websocket.url", "http://localhost:40000" + SONAR_CLOUD_PORT);
     folder1BaseDir = makeStaticTempDir();
     folder2BaseDir = makeStaticTempDir();
     initialize(Map.of(
@@ -60,6 +83,12 @@ class LanguageServerWithFoldersMediumTests extends AbstractLanguageServerMediumT
         "productVersion", "0.1",
         "productKey", "productKey"),
       new WorkspaceFolder(folder1BaseDir.toUri().toString(), "My Folder 1"));
+  }
+
+  @AfterAll
+  public static void resetSonarCloud() {
+    System.clearProperty("sonarlint.internal.sonarcloud.websocket.url");
+    System.clearProperty("sonarlint.internal.sonarcloud.url");
   }
 
   @Override
@@ -203,6 +232,28 @@ class LanguageServerWithFoldersMediumTests extends AbstractLanguageServerMediumT
       "contributing to unnecessary complexity and leading to confusion when reading the code.");
     assertThat(client.ruleDesc.getType()).isEqualTo("CODE_SMELL");
     assertThat(client.ruleDesc.getSeverity()).isEqualTo("MINOR");
+  }
+
+  @Test
+  void list_user_organizations() {
+    var paging = Common.Paging.newBuilder()
+      .setPageSize(500)
+      .setTotal(1)
+      .setPageIndex(1)
+      .build();
+    var organization = Organizations.Organization.newBuilder()
+      .setKey("key")
+      .setName("name")
+      .build();
+    sonarCloudWebServer.addProtobufResponse("/api/organizations/search.protobuf?member=true&ps=500&p=1",
+      Organizations.SearchWsResponse.newBuilder()
+        .addAllOrganizations(List.of(organization))
+        .setPaging(paging)
+        .build());
+    var token = "123456";
+    var result = lsProxy.listUserOrganizations(token).join();
+    assertThat(result).hasSize(1);
+    assertThat(result.get(0).getKey()).isEqualTo("key");
   }
 
 }
